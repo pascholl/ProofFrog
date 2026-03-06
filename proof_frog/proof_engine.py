@@ -4,7 +4,7 @@ import functools
 import warnings
 from enum import Enum
 from collections import namedtuple
-from typing import TypeAlias, Tuple, Dict, Optional, TypeVar, Union
+from typing import TypeAlias, Callable, Tuple, Dict, Optional, TypeVar, Union
 import z3
 from colorama import Fore
 from sympy import Symbol
@@ -13,6 +13,7 @@ from . import visitors
 from . import dependencies
 
 MethodLookup: TypeAlias = Dict[Tuple[str, str], frog_ast.Method]
+_StdFn: TypeAlias = Callable[[frog_ast.Game], frog_ast.Game]
 
 _MAX_FIXED_POINT_ITERATIONS = 200
 
@@ -24,6 +25,7 @@ class WhichGame(Enum):
 
 ProcessedAssumption = namedtuple("ProcessedAssumption", ["assumption", "which"])
 HopResult = namedtuple("HopResult", ["step_num", "valid", "kind", "depth"])
+AstManipulator = namedtuple("AstManipulator", ["fn", "name"])
 
 
 class FailedProof(Exception):
@@ -344,11 +346,9 @@ class ProofEngine:
                 ProcessedAssumption(assumption=expression, which=applies_to)
             )
 
-    def check_equivalent(
-        self, current_game_ast: frog_ast.Game, next_game_ast: frog_ast.Game
-    ) -> bool:
-        AstManipulator = namedtuple("AstManipulator", ["fn", "name"])
-        ast_manipulators: list[AstManipulator] = [
+    def _get_ast_manipulators(self) -> list[AstManipulator]:
+        """Return the 16 base AST transformation passes used for canonicalization."""
+        return [
             AstManipulator(
                 fn=lambda ast: visitors.SymbolicComputationTransformer(
                     self.variables
@@ -416,6 +416,11 @@ class ProofEngine:
                 name="Remove unreachable blocks of code",
             ),
         ]
+
+    def check_equivalent(
+        self, current_game_ast: frog_ast.Game, next_game_ast: frog_ast.Game
+    ) -> bool:
+        ast_manipulators = self._get_ast_manipulators()
 
         for index, game in enumerate((current_game_ast, next_game_ast)):
 
@@ -560,75 +565,7 @@ class ProofEngine:
         """Apply the same simplification pipeline as check_equivalent() (without
         step-specific assumptions) and the final standardization steps, returning
         the canonical form of the game as printed by the prove command."""
-        AstManipulator = namedtuple("AstManipulator", ["fn", "name"])
-        ast_manipulators: list[AstManipulator] = [
-            AstManipulator(
-                fn=lambda ast: visitors.SymbolicComputationTransformer(
-                    self.variables
-                ).transform(ast),
-                name="Symbolic Computation",
-            ),
-            AstManipulator(
-                fn=lambda ast: visitors.SimplifySpliceTransformer(
-                    self.variables
-                ).transform(ast),
-                name="Simplifying Splices",
-            ),
-            AstManipulator(
-                fn=lambda ast: visitors.RedundantCopyTransformer().transform(ast),
-                name="Remove Redundant Copies",
-            ),
-            AstManipulator(
-                fn=lambda ast: visitors.InlineSingleUseVariableTransformer().transform(
-                    ast
-                ),
-                name="Inline Single-Use Variables",
-            ),
-            AstManipulator(fn=self.sort_game, name="Topological Sorting"),
-            AstManipulator(fn=remove_duplicate_fields, name="Remove Duplicate Fields"),
-            AstManipulator(
-                fn=lambda ast: visitors.BranchEliminiationTransformer().transform(ast),
-                name="Branch Elimination",
-            ),
-            AstManipulator(
-                fn=dependencies.remove_unnecessary_fields,
-                name="Remove unnecessary statements and fields",
-            ),
-            AstManipulator(
-                fn=lambda ast: visitors.CollapseAssignmentTransformer().transform(ast),
-                name="Collapse Assignment",
-            ),
-            AstManipulator(
-                fn=lambda ast: visitors.SimplifyReturnTransformer().transform(ast),
-                name="Simplify Returns",
-            ),
-            AstManipulator(
-                fn=lambda ast: visitors.SimplifyIfTransformer().transform(ast),
-                name="Simplify Ifs",
-            ),
-            AstManipulator(
-                fn=lambda ast: visitors.ExpandTupleTransformer().transform(ast),
-                name="Expand Tuples",
-            ),
-            AstManipulator(
-                fn=lambda ast: visitors.SimplifyNot().transform(ast),
-                name="Simplify Nots",
-            ),
-            AstManipulator(
-                fn=lambda ast: visitors.RedundantFieldCopyTransformer().transform(ast),
-                name="Remove redundant variables for fields",
-            ),
-            AstManipulator(
-                fn=lambda ast: visitors.SimplifyTupleTransformer(ast).transform(ast),
-                name="Simplify tuples that are copies of their fields",
-            ),
-            AstManipulator(
-                fn=lambda ast: visitors.RemoveUnreachableTransformer(ast).transform(
-                    ast
-                ),
-                name="Remove unreachable blocks of code",
-            ),
-        ]
+        ast_manipulators = self._get_ast_manipulators()
         for _iteration in range(_MAX_FIXED_POINT_ITERATIONS):
             new_game = game
             for manipulator in ast_manipulators:
@@ -646,6 +583,191 @@ class ProofEngine:
         game = standardize_field_names(game)
         game = dependencies.BubbleSortFieldAssignment().transform(game)
         return game
+
+    def canonicalize_game_with_trace(
+        self, game: frog_ast.Game
+    ) -> tuple[frog_ast.Game, dict[str, object]]:
+        """Same pipeline as canonicalize_game, but records which transforms
+        fired at each iteration of the fixed-point loop."""
+        ast_manipulators = self._get_ast_manipulators()
+        iterations: list[dict[str, object]] = []
+        converged = False
+        for iteration in range(_MAX_FIXED_POINT_ITERATIONS):
+            transforms_applied: list[str] = []
+            new_game = game
+            for manipulator in ast_manipulators:
+                before = new_game
+                new_game = manipulator.fn(new_game)
+                if new_game != before:
+                    transforms_applied.append(manipulator.name)
+            if new_game == game:
+                converged = True
+                break
+            iterations.append(
+                {"iteration": iteration + 1, "transforms_applied": transforms_applied}
+            )
+            game = new_game
+        if not converged:
+            warnings.warn(
+                "Canonicalization did not converge within "
+                f"{_MAX_FIXED_POINT_ITERATIONS} iterations",
+                stacklevel=2,
+            )
+        game = visitors.VariableStandardizingTransformer().transform(game)
+        game = standardize_field_names(game)
+        game = dependencies.BubbleSortFieldAssignment().transform(game)
+        trace: dict[str, object] = {
+            "iterations": iterations,
+            "total_iterations": len(iterations),
+            "converged": converged,
+        }
+        return game, trace
+
+    _STANDARDIZATION_NAMES = [
+        "Variable Standardizing",
+        "Standardize Field Names",
+        "Bubble Sort Field Assignment",
+    ]
+
+    def _apply_standardization(self, game: frog_ast.Game) -> frog_ast.Game:
+        """Apply the three post-fixed-point standardization passes."""
+        game = visitors.VariableStandardizingTransformer().transform(game)
+        game = standardize_field_names(game)
+        game = dependencies.BubbleSortFieldAssignment().transform(game)
+        return game
+
+    def find_divergence(
+        self, game1: frog_ast.Game, game2: frog_ast.Game
+    ) -> dict[str, object]:
+        """Run canonicalization on both games and report where they diverge.
+
+        Compares the two games after each transformation in each fixed-point
+        iteration, then after each standardization pass, to identify the last
+        transform after which they were still equal or the first where they
+        diverge.
+        """
+        ast_manipulators = self._get_ast_manipulators()
+
+        # Run fixed-point loop on both games in lockstep
+        last_equal_point: dict[str, object] | None = None
+        first_diverge_point: dict[str, object] | None = None
+        were_equal = game1 == game2
+
+        if were_equal:
+            last_equal_point = {"iteration": 0, "transform": "(initial)"}
+
+        converged1 = False
+        converged2 = False
+        for iteration in range(_MAX_FIXED_POINT_ITERATIONS):
+            new_game1 = game1
+            new_game2 = game2
+            for manipulator in ast_manipulators:
+                before1 = new_game1
+                before2 = new_game2
+                new_game1 = manipulator.fn(new_game1)
+                new_game2 = manipulator.fn(new_game2)
+                now_equal = new_game1 == new_game2
+                if were_equal and not now_equal and first_diverge_point is None:
+                    first_diverge_point = {
+                        "iteration": iteration + 1,
+                        "transform": manipulator.name,
+                    }
+                    # Store game states at the divergence point
+                    first_diverge_point["current_before_transform"] = str(before1)
+                    first_diverge_point["next_before_transform"] = str(before2)
+                    first_diverge_point["current_after_transform"] = str(new_game1)
+                    first_diverge_point["next_after_transform"] = str(new_game2)
+                if now_equal:
+                    last_equal_point = {
+                        "iteration": iteration + 1,
+                        "transform": manipulator.name,
+                    }
+                were_equal = now_equal
+            if new_game1 == game1:
+                converged1 = True
+            if new_game2 == game2:
+                converged2 = True
+            game1 = new_game1
+            game2 = new_game2
+            if converged1 and converged2:
+                break
+
+        # Apply standardization passes one at a time, comparing after each
+        std_fns: list[_StdFn] = [
+            lambda g: visitors.VariableStandardizingTransformer().transform(g),
+            standardize_field_names,
+            lambda g: dependencies.BubbleSortFieldAssignment().transform(g),
+        ]
+        for name, fn in zip(self._STANDARDIZATION_NAMES, std_fns):
+            before1 = game1
+            before2 = game2
+            game1 = fn(game1)
+            game2 = fn(game2)
+            now_equal = game1 == game2
+            if were_equal and not now_equal and first_diverge_point is None:
+                first_diverge_point = {
+                    "iteration": "standardization",
+                    "transform": name,
+                    "current_before_transform": str(before1),
+                    "next_before_transform": str(before2),
+                    "current_after_transform": str(game1),
+                    "next_after_transform": str(game2),
+                }
+            if now_equal:
+                last_equal_point = {
+                    "iteration": "standardization",
+                    "transform": name,
+                }
+            were_equal = now_equal
+
+        equivalent = game1 == game2
+        result: dict[str, object] = {"equivalent": equivalent}
+        if equivalent:
+            return result
+        result["current_canonical"] = str(game1)
+        result["next_canonical"] = str(game2)
+        if first_diverge_point is not None:
+            result["first_diverge_point"] = first_diverge_point
+        if last_equal_point is not None:
+            result["last_equal_point"] = last_equal_point
+        return result
+
+    def canonicalize_until_transform(
+        self, game: frog_ast.Game, transform_name: str
+    ) -> tuple[frog_ast.Game, bool, list[str]]:
+        """Apply transforms up to and including ``transform_name`` (first
+        iteration only) and return the resulting game.
+
+        Returns ``(game_after, transform_changed_ast, available_names)``.
+        """
+        ast_manipulators = self._get_ast_manipulators()
+        available_names = [
+            m.name for m in ast_manipulators
+        ] + self._STANDARDIZATION_NAMES
+
+        if transform_name not in available_names:
+            return game, False, available_names
+
+        # Apply core transforms up to and including the named one
+        for manipulator in ast_manipulators:
+            before = game
+            game = manipulator.fn(game)
+            if manipulator.name == transform_name:
+                return game, game != before, available_names
+
+        # Must be a standardization pass
+        std_fns: list[_StdFn] = [
+            lambda g: visitors.VariableStandardizingTransformer().transform(g),
+            standardize_field_names,
+            lambda g: dependencies.BubbleSortFieldAssignment().transform(g),
+        ]
+        for name, fn in zip(self._STANDARDIZATION_NAMES, std_fns):
+            before = game
+            game = fn(game)
+            if name == transform_name:
+                return game, game != before, available_names
+
+        return game, False, available_names
 
     def apply_reduction(
         self,
